@@ -37,3 +37,24 @@ __pycache__
 
 # python
 dist/
+
+# Robot runtime outputs and local backups
+/logs/
+/tmp/
+/backups/
+*.log
+*.pid
+*.bak*
+*.pre_safety_*.py
+*.pre_retry_*.py
+/pos5
+/readpos
+
+# Local credentials and environments
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+venv/

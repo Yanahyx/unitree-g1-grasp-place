@@ -1,0 +1,1055 @@
+#!/usr/bin/env python3
+"""Fixed-point lateral grasp sequence for the real G1 right arm.
+
+Sequence:
+1. Move right hand to PREGRASP_TARGET in pelvis frame.
+2. Open RH56E2 hand to the tested maximum-open preset.
+3. Move the whole right hand to the final grasp target.
+4. Close the hand to grasp.
+5. Move back to PREGRASP_TARGET.
+6. Return the right arm to its start posture and release arm_sdk.
+
+This script lives in real_arm_grasp and does not modify the older grasp code.
+"""
+
+import argparse
+import os
+import json
+import socket
+import sys
+from argparse import Namespace
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+THIS_DIR = Path(__file__).resolve().parent
+G1_DIR = THIS_DIR.parents[0]
+GRASP_DIR = G1_DIR / "grasp"
+HANDS_DIR = G1_DIR / "hands"
+for path in (THIS_DIR, GRASP_DIR, HANDS_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from g1_right_arm_body_ik_example import (  # noqa: E402
+    G1JointIndex,
+    format_joint_delta_table,
+    format_joint_table,
+    model_to_motor_q,
+    motor_to_model_q,
+    right_arm_joints,
+    right_hand_pose,
+    solve_position_ik,
+    validate_target,
+)
+from g1_portable_vision_grasp import (  # noqa: E402
+    camera_to_pelvis,
+    depth_point_for_detection,
+    detect_object,
+    load_model,
+    run_capture,
+)
+from g1_right_arm_official_style_reach import (  # noqa: E402
+    LEFT_ARM_7DOF,
+    WAIST_JOINTS,
+    OfficialStyleArmSdkController,
+    detect_interface,
+    hold_group,
+    joint_positions,
+    joint_vector,
+    joint_velocity_abs_max,
+    release_group,
+    run_timed_phase,
+)
+from rh56e2_hand_only import write_hand_pose  # noqa: E402
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient  # noqa: E402
+
+
+PREGRASP_TARGET = np.asarray([0.30, -0.30, 0.12], dtype=float)
+FIXED_GRASP_Z = 0.12
+DEFAULT_HAND_OPEN_ANGLE = [1000, 1000, 1000, 1000, 1000, 0]
+DEFAULT_HAND_GRASP_ANGLE = [0, 0, 0, 0, 0, 400]
+DEFAULT_WRIST_ROLL = 0.30
+DEFAULT_WRIST_PITCH = -0.80
+DEFAULT_WRIST_YAW = 0.50
+DEFAULT_ANYGRASP_WRIST_CANDIDATES = (
+    None,
+    (DEFAULT_WRIST_ROLL, DEFAULT_WRIST_PITCH, DEFAULT_WRIST_YAW),
+    (0.0, -0.8, 0.0),
+    (0.0, -0.5, 0.0),
+)
+WRIST_LIMITS = {
+    G1JointIndex.RightWristRoll: (-1.9722, 1.9722),
+    G1JointIndex.RightWristPitch: (-1.6144, 1.6144),
+    G1JointIndex.RightWristYaw: (-1.6144, 1.6144),
+}
+WRIST_NAMES = {
+    G1JointIndex.RightWristRoll: "RightWristRoll",
+    G1JointIndex.RightWristPitch: "RightWristPitch",
+    G1JointIndex.RightWristYaw: "RightWristYaw",
+}
+HAND_NETWORK_HINT = """Hand TCP preflight failed.
+
+The RH56E2 hand is expected at 192.168.124.210:6000. If the robot was rebooted,
+add the temporary secondary address on eth1, then probe the hand:
+
+  sudo ip addr add 192.168.124.164/24 dev eth1
+
+  cd /home/unitree/unitree_sdk2_python
+  python3 example/g1/high_level/rh56e2_modbus_probe.py \\
+    --ip 192.168.124.210 \\
+    --port 6000
+
+Expected probe output includes: TCP connected and ID: 1.
+"""
+
+
+@dataclass
+class AnyGraspPose:
+    path: Path
+    score: float
+    width_m: Optional[float]
+    translation_camera: np.ndarray
+    rotation_camera: np.ndarray
+    approach_camera: np.ndarray
+    center_pelvis: np.ndarray
+    approach_pelvis: np.ndarray
+    closing_axis_pelvis: np.ndarray
+
+
+@dataclass
+class GraspCandidate:
+    label: str
+    pre_target: np.ndarray
+    grasp_target: np.ndarray
+    approach_pelvis: np.ndarray
+    closing_axis_pelvis: np.ndarray
+    palm_offset: float
+    pregrasp_distance: float
+    wrist_targets: Optional[Tuple[float, float, float]]
+
+
+@dataclass
+class CandidateSolution:
+    candidate: GraspCandidate
+    pre_ik: object
+    q_pre_values: np.ndarray
+    q_pre: Dict[int, float]
+    grasp_ik: object
+    q_grasp_values: np.ndarray
+    q_grasp: Dict[int, float]
+    pre_command_residual: float
+    grasp_command_residual: float
+    score: float
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fixed-point lateral right-arm grasp sequence.")
+    parser.add_argument("network_interface", nargs="?", default=None, help="DDS interface, e.g. eth1.")
+    parser.add_argument(
+        "--pregrasp-target",
+        nargs=3,
+        type=float,
+        default=PREGRASP_TARGET.tolist(),
+        metavar=("X", "Y", "Z"),
+        help="Saved first point in pelvis frame. Default: 0.30 -0.30 0.12.",
+    )
+    parser.add_argument("--left-distance", type=float, default=0.10, help="Pelvis-frame +Y lateral move before grasp.")
+    parser.add_argument("--use-vision", action="store_true", help="Use RGB-D vision to override final grasp XY.")
+    parser.add_argument("--object", default="bottle", help="Open-vocabulary object name for YOLO-World.")
+    parser.add_argument("--camera-pitch", type=float, default=0.8)
+    parser.add_argument("--fixed-grasp-z", type=float, default=FIXED_GRASP_Z)
+    parser.add_argument("--vision-xy-offset", nargs=2, type=float, default=[0.0, 0.0], metavar=("X", "Y"))
+    parser.add_argument("--vision-host", default="unitree@192.168.1.103")
+    parser.add_argument("--vision-password", default=os.environ.get("ROBOT_SSH_PASSWORD", ""))
+    parser.add_argument("--use-anygrasp-json", action="store_true", help="Use selected AnyGrasp JSON to set pregrasp/grasp targets.")
+    parser.add_argument(
+        "--anygrasp-json",
+        default=str(THIS_DIR / "grasp_detection" / "log" / "selected_grasp.json"),
+        help="Path to JSON saved by grasp_detection/demo.py --save_grasp_json.",
+    )
+    parser.add_argument("--anygrasp-pregrasp-distance", type=float, default=0.10, help="Back off along AnyGrasp approach direction.")
+    parser.add_argument("--anygrasp-palm-offset", type=float, default=0.04, help="Offset palm target behind AnyGrasp center.")
+    parser.add_argument("--anygrasp-approach-sign", type=float, default=1.0, help="Flip AnyGrasp approach axis with -1 if pregrasp is on the wrong side.")
+    parser.add_argument("--anygrasp-approach-column", type=int, choices=(0, 1, 2), default=2, help="Rotation matrix column used as fallback approach axis.")
+    parser.add_argument("--anygrasp-use-fixed-z", action="store_true", help="Use --fixed-grasp-z instead of AnyGrasp Z for both targets.")
+    parser.add_argument("--anygrasp-min-score", type=float, default=0.0, help="Reject AnyGrasp JSON below this score.")
+    parser.add_argument(
+        "--no-anygrasp-candidate-mode",
+        dest="anygrasp_candidate_mode",
+        action="store_false",
+        help="Use the legacy single AnyGrasp target instead of multi-candidate scoring.",
+    )
+    parser.set_defaults(anygrasp_candidate_mode=True)
+    parser.add_argument("--anygrasp-width-clearance", type=float, default=0.02, help="Extra opening around AnyGrasp width in meters.")
+    parser.add_argument("--anygrasp-min-z", type=float, default=0.06, help="Minimum pelvis-frame Z for AnyGrasp candidate targets.")
+    parser.add_argument("--anygrasp-candidate-tolerance", type=float, default=0.04, help="IK tolerance used while scoring AnyGrasp candidates.")
+    parser.add_argument(
+        "--anygrasp-max-command-residual",
+        type=float,
+        default=0.06,
+        help="Reject AnyGrasp candidates whose FK command residual exceeds this value.",
+    )
+    parser.add_argument(
+        "--anygrasp-print-candidates",
+        type=int,
+        default=12,
+        help="Number of scored AnyGrasp candidates to print in dry-run/execution logs.",
+    )
+    parser.add_argument("--hand-width-min", type=float, default=0.03, help="Width mapped to the closed RH56E2 preset.")
+    parser.add_argument("--hand-width-max", type=float, default=0.09, help="Width mapped to the open RH56E2 preset.")
+    parser.add_argument(
+        "--no-anygrasp-hand-from-width",
+        dest="anygrasp_hand_from_width",
+        action="store_false",
+        help="Keep fixed hand-open/hand-grasp presets when using AnyGrasp.",
+    )
+    parser.set_defaults(anygrasp_hand_from_width=True)
+    parser.add_argument("--execute", action="store_true", help="Actually move the arm and hand.")
+    parser.add_argument("--yes", action="store_true", help="Confirm the robot and hand have clear space.")
+    parser.add_argument("--weight", type=float, default=0.75)
+    parser.add_argument("--allow-full-weight", action="store_true")
+    parser.add_argument("--pre-duration", type=float, default=6.0)
+    parser.add_argument("--lateral-duration", type=float, default=3.0)
+    parser.add_argument("--return-duration", type=float, default=5.0)
+    parser.add_argument("--hold-before-open", type=float, default=0.5)
+    parser.add_argument("--hold-after-open", type=float, default=0.5)
+    parser.add_argument("--hold-before-grasp", type=float, default=0.5)
+    parser.add_argument("--hold-after-grasp", type=float, default=0.8)
+    parser.add_argument(
+        "--wrist-roll-target",
+        type=float,
+        default=DEFAULT_WRIST_ROLL,
+        help="RightWristRoll target used for the grasp wrist pose.",
+    )
+    parser.add_argument(
+        "--wrist-pitch-target",
+        type=float,
+        default=DEFAULT_WRIST_PITCH,
+        help="RightWristPitch target used for the grasp wrist pose.",
+    )
+    parser.add_argument(
+        "--wrist-yaw-target",
+        type=float,
+        default=DEFAULT_WRIST_YAW,
+        help="RightWristYaw target used for the grasp wrist pose.",
+    )
+    parser.add_argument(
+        "--no-vertical-wrist",
+        action="store_true",
+        help="Disable the explicit wrist roll/pitch/yaw override.",
+    )
+    parser.add_argument("--release-duration", type=float, default=1.0)
+    parser.add_argument("--tolerance", type=float, default=0.025)
+    parser.add_argument("--max-joint-delta", type=float, default=2.2)
+    parser.add_argument("--max-joint-speed", type=float, default=0.35)
+    parser.add_argument("--max-start-arm-dq", type=float, default=0.8)
+    parser.add_argument("--max-start-waist-dq", type=float, default=0.4)
+    parser.add_argument("--kp-right", type=float, default=60.0)
+    parser.add_argument("--kd-right", type=float, default=1.5)
+    parser.add_argument("--kp-left", type=float, default=60.0)
+    parser.add_argument("--kd-left", type=float, default=1.5)
+    parser.add_argument("--kp-waist", type=float, default=60.0)
+    parser.add_argument("--kd-waist", type=float, default=1.5)
+    parser.add_argument("--hand-ip", default="192.168.124.210")
+    parser.add_argument("--hand-port", type=int, default=6000)
+    parser.add_argument("--hand-unit-id", type=int, default=1)
+    parser.add_argument("--hand-timeout", type=float, default=2.0)
+    parser.add_argument("--hand-speed", type=int, default=200)
+    parser.add_argument("--hand-force", type=int, default=1000)
+    parser.add_argument("--hand-hold", type=float, default=0.8)
+    parser.add_argument("--hand-open-angle", nargs=6, type=int, default=DEFAULT_HAND_OPEN_ANGLE)
+    parser.add_argument("--hand-grasp-angle", nargs=6, type=int, default=DEFAULT_HAND_GRASP_ANGLE)
+    parser.add_argument("--skip-hand", action="store_true", help="Run arm motion only; do not command RH56E2.")
+    parser.add_argument("--announce-text", default="抓取完成")
+    parser.add_argument("--announce-speaker-id", type=int, default=0)
+    parser.add_argument("--no-announce", action="store_true")
+    return parser.parse_args()
+
+
+def hand_args(args: argparse.Namespace) -> Namespace:
+    return Namespace(
+        ip=args.hand_ip,
+        port=args.hand_port,
+        unit_id=args.hand_unit_id,
+        timeout=args.hand_timeout,
+        speed=args.hand_speed,
+        force=args.hand_force,
+        hold=args.hand_hold,
+        read_before=False,
+        read_after=False,
+    )
+
+
+def solve_right_q(
+    target: np.ndarray,
+    waist_q: np.ndarray,
+    right_joints: Sequence[int],
+    seed_motor_q: np.ndarray,
+    tolerance: float,
+) -> Tuple[object, np.ndarray, Dict[int, float]]:
+    signs = np.ones(7)
+    seed_model_q = motor_to_model_q(seed_motor_q, signs)
+    ik = solve_position_ik(
+        target=target,
+        waist_q=waist_q,
+        joint_indices=right_joints,
+        signs=signs,
+        seed=seed_model_q,
+        tolerance=tolerance,
+    )
+    q_values = model_to_motor_q(ik.q_model, signs)
+    return ik, q_values, {joint: float(value) for joint, value in zip(right_joints, q_values)}
+
+
+def validate_wrist_target(joint: int, value: float) -> None:
+    low, high = WRIST_LIMITS[joint]
+    if not low <= value <= high:
+        raise ValueError(f"{WRIST_NAMES[joint]} must be within [{low:.4f}, {high:.4f}] rad")
+
+
+def apply_wrist_targets(
+    q_values: np.ndarray,
+    q_targets: Dict[int, float],
+    right_joints: Sequence[int],
+    wrist_roll_target: float,
+    wrist_pitch_target: float,
+    wrist_yaw_target: float,
+) -> Tuple[np.ndarray, Dict[int, float]]:
+    adjusted_values = np.asarray(q_values, dtype=float).copy()
+    adjusted_targets = dict(q_targets)
+    wrist_targets = {
+        G1JointIndex.RightWristRoll: wrist_roll_target,
+        G1JointIndex.RightWristPitch: wrist_pitch_target,
+        G1JointIndex.RightWristYaw: wrist_yaw_target,
+    }
+    for joint, value in wrist_targets.items():
+        if joint in right_joints:
+            index = right_joints.index(joint)
+            adjusted_values[index] = float(value)
+            adjusted_targets[joint] = float(value)
+    return adjusted_values, adjusted_targets
+
+
+def segment_duration(default_duration: float, q_from: np.ndarray, q_to: np.ndarray, max_speed: float) -> float:
+    delta = float(np.max(np.abs(q_to - q_from)))
+    return max(default_duration, delta / max(max_speed, 1e-6))
+
+
+def print_plan_item(name: str, target: np.ndarray, ik, q_values: np.ndarray, q_prev: np.ndarray, right_joints) -> None:
+    print(f"{name}_target_pelvis_xyz:", np.array2string(target, precision=4))
+    print(f"{name}_ik_success:", ik.success)
+    print(f"{name}_ik_residual_m: {ik.residual:.4f}")
+    print(f"{name}_ik_reached_xyz:", np.array2string(ik.reached, precision=4))
+    print(f"{name}_right_goal:")
+    print(format_joint_table(right_joints, q_values))
+    print(f"{name}_right_delta:")
+    print(format_joint_delta_table(right_joints, q_prev, q_values))
+
+
+def print_command_position(name: str, target: np.ndarray, q_values: np.ndarray, waist_q: np.ndarray, right_joints) -> None:
+    model_q = motor_to_model_q(q_values, np.ones(7))
+    pose = right_hand_pose(model_q, waist_q, right_joints)
+    reached = pose[:3, 3]
+    residual = float(np.linalg.norm(target - reached))
+    print(f"{name}_command_reached_xyz:", np.array2string(reached, precision=4))
+    print(f"{name}_command_residual_m: {residual:.4f}")
+
+
+def validate_hand_args(args: argparse.Namespace) -> int:
+    if args.hand_speed < 0 or args.hand_speed > 1000 or args.hand_force < 0 or args.hand_force > 1000:
+        print("Refusing hand command: speed/force must be in 0..1000.", file=sys.stderr)
+        return 2
+    if any(value < 0 or value > 1000 for value in args.hand_open_angle + args.hand_grasp_angle):
+        print("Refusing hand command: all hand angles must be in 0..1000.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def hand_tcp_preflight(args: argparse.Namespace) -> bool:
+    try:
+        with socket.create_connection((args.hand_ip, args.hand_port), timeout=args.hand_timeout):
+            return True
+    except OSError as exc:
+        print(f"hand_preflight_connect: {args.hand_ip}:{args.hand_port} failed: {exc}", file=sys.stderr)
+        print(HAND_NETWORK_HINT, file=sys.stderr)
+        return False
+
+
+def announce_success(args: argparse.Namespace) -> None:
+    if args.no_announce or not args.announce_text:
+        return
+    try:
+        audio_client = AudioClient()
+        audio_client.SetTimeout(10.0)
+        audio_client.Init()
+        code = audio_client.TtsMaker(args.announce_text, args.announce_speaker_id)
+        if code != 0:
+            print(f"Warning: TTS announcement failed with code {code}.", file=sys.stderr)
+        else:
+            print(f"TTS announced: {args.announce_text}")
+    except Exception as exc:
+        print(f"Warning: TTS announcement failed: {exc}", file=sys.stderr)
+
+
+def compute_vision_grasp_target(args: argparse.Namespace, pre_target: np.ndarray) -> np.ndarray:
+    capture_args = Namespace(
+        host=args.vision_host,
+        password=args.vision_password,
+        interface=args.network_interface,
+    )
+    capture = run_capture(capture_args)
+    model, model_path = load_model(args.object)
+    det = detect_object(model, capture["color_bgr"], args.object)
+    point_camera, depth_stats = depth_point_for_detection(capture, det)
+    point_pelvis = camera_to_pelvis(point_camera, args.camera_pitch)
+
+    target = pre_target.copy()
+    target[0] = point_pelvis[0] + args.vision_xy_offset[0]
+    target[1] = point_pelvis[1] + args.vision_xy_offset[1]
+    target[2] = args.fixed_grasp_z
+
+    print("vision_model:", model_path)
+    print("vision_detection:", det)
+    print("vision_depth_stats:", depth_stats)
+    print("vision_point_camera_m:", np.array2string(point_camera, precision=4))
+    print("vision_point_pelvis_m:", np.array2string(point_pelvis, precision=4))
+    print("vision_xy_offset_m:", np.array2string(np.asarray(args.vision_xy_offset, dtype=float), precision=4))
+    print("vision_fixed_grasp_z:", f"{args.fixed_grasp_z:.4f}")
+    return target
+
+
+def _json_vector(data: dict, keys: Sequence[str], length: int, label: str) -> np.ndarray:
+    for key in keys:
+        if key in data:
+            value = np.asarray(data[key], dtype=float)
+            if value.shape == (length,):
+                return value
+            raise ValueError(f"{label} in {key} must have shape ({length},), got {value.shape}")
+    raise KeyError(f"AnyGrasp JSON missing {label}; tried keys: {', '.join(keys)}")
+
+
+def _json_rotation(data: dict) -> np.ndarray:
+    for key in ("rotation_matrix_camera", "rotation_matrix", "rotation"):
+        if key in data:
+            value = np.asarray(data[key], dtype=float)
+            if value.shape == (3, 3):
+                return value
+            if value.size == 9:
+                return value.reshape(3, 3)
+            raise ValueError(f"rotation in {key} must be 3x3 or length 9, got {value.shape}")
+    return np.eye(3)
+
+
+def _camera_vector_to_pelvis(vector_camera: np.ndarray, camera_pitch: float) -> np.ndarray:
+    origin = camera_to_pelvis(np.zeros(3, dtype=float), camera_pitch)
+    endpoint = camera_to_pelvis(vector_camera, camera_pitch)
+    vector = endpoint - origin
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-6:
+        raise ValueError("AnyGrasp approach direction is near zero after camera_to_pelvis conversion")
+    return vector / norm
+
+
+def _normalize_vector(vector: np.ndarray, label: str) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-6:
+        raise ValueError(f"{label} is near zero")
+    return np.asarray(vector, dtype=float) / norm
+
+
+def camera_rotation_to_pelvis(rotation_camera: np.ndarray, camera_pitch: float) -> np.ndarray:
+    columns = [_camera_vector_to_pelvis(rotation_camera[:, index], camera_pitch) for index in range(3)]
+    return np.column_stack(columns)
+
+
+def _orthogonal_axis(axis: np.ndarray, reference: np.ndarray, label: str) -> np.ndarray:
+    projected = np.asarray(axis, dtype=float) - float(np.dot(axis, reference)) * reference
+    return _normalize_vector(projected, label)
+
+
+def _safe_orthogonal_axis(axis: np.ndarray, reference: np.ndarray, label: str) -> np.ndarray:
+    for candidate in (
+        axis,
+        np.asarray([0.0, 1.0, 0.0], dtype=float),
+        np.asarray([0.0, 0.0, 1.0], dtype=float),
+        np.asarray([1.0, 0.0, 0.0], dtype=float),
+    ):
+        try:
+            return _orthogonal_axis(candidate, reference, label)
+        except ValueError:
+            continue
+    raise ValueError(f"{label} could not find an axis orthogonal to the approach")
+
+
+def load_anygrasp_pose(args: argparse.Namespace) -> AnyGraspPose:
+    path = Path(args.anygrasp_json).expanduser()
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    score = float(data.get("score", 0.0))
+    if score < args.anygrasp_min_score:
+        raise ValueError(f"AnyGrasp score {score:.4f} below --anygrasp-min-score {args.anygrasp_min_score:.4f}")
+
+    translation_camera = _json_vector(
+        data,
+        ("translation_camera_m", "translation", "translation_xyz_m", "center_camera_m"),
+        3,
+        "translation_camera_m",
+    )
+    rotation_camera = _json_rotation(data)
+    if "approach_axis_camera" in data:
+        approach_camera = np.asarray(data["approach_axis_camera"], dtype=float)
+    else:
+        approach_camera = rotation_camera[:, args.anygrasp_approach_column]
+    approach_camera = approach_camera * float(args.anygrasp_approach_sign)
+
+    center_pelvis = camera_to_pelvis(translation_camera, args.camera_pitch)
+    approach_pelvis = _camera_vector_to_pelvis(approach_camera, args.camera_pitch)
+    rotation_pelvis = camera_rotation_to_pelvis(rotation_camera, args.camera_pitch)
+    closing_candidates = [
+        _orthogonal_axis(rotation_pelvis[:, index], approach_pelvis, f"AnyGrasp closing axis column {index}")
+        for index in range(3)
+        if abs(float(np.dot(rotation_pelvis[:, index], approach_pelvis))) < 0.98
+    ]
+    if closing_candidates:
+        closing_axis_pelvis = max(closing_candidates, key=lambda axis: 1.0 - abs(float(np.dot(axis, approach_pelvis))))
+    else:
+        closing_axis_pelvis = _orthogonal_axis(rotation_pelvis[:, 0], approach_pelvis, "AnyGrasp closing axis")
+
+    width_value = data.get("width_m", data.get("width"))
+    width_m = None if width_value is None else float(width_value)
+
+    print("anygrasp_json:", path)
+    print(f"anygrasp_score: {score:.4f}")
+    print("anygrasp_width_m:", width_m)
+    print("anygrasp_translation_camera_m:", np.array2string(translation_camera, precision=4))
+    print("anygrasp_approach_camera:", np.array2string(approach_camera, precision=4))
+    print("anygrasp_center_pelvis_xyz:", np.array2string(center_pelvis, precision=4))
+    print("anygrasp_approach_pelvis:", np.array2string(approach_pelvis, precision=4))
+    print("anygrasp_closing_axis_pelvis:", np.array2string(closing_axis_pelvis, precision=4))
+    return AnyGraspPose(
+        path=path,
+        score=score,
+        width_m=width_m,
+        translation_camera=translation_camera,
+        rotation_camera=rotation_camera,
+        approach_camera=approach_camera,
+        center_pelvis=center_pelvis,
+        approach_pelvis=approach_pelvis,
+        closing_axis_pelvis=closing_axis_pelvis,
+    )
+
+
+def _unique_float_values(values: Sequence[float]) -> List[float]:
+    unique = []
+    for value in values:
+        value = float(value)
+        if not any(abs(value - existing) < 1e-6 for existing in unique):
+            unique.append(value)
+    return unique
+
+
+def _append_unique_axis(axes: List[np.ndarray], axis: np.ndarray) -> None:
+    axis = _normalize_vector(axis, "AnyGrasp candidate axis")
+    if not any(abs(float(np.dot(axis, existing))) > 0.995 for existing in axes):
+        axes.append(axis)
+
+
+def _candidate_wrist_options(args: argparse.Namespace) -> List[Optional[Tuple[float, float, float]]]:
+    if args.no_vertical_wrist:
+        return [None]
+    if not args.anygrasp_candidate_mode:
+        return [(args.wrist_roll_target, args.wrist_pitch_target, args.wrist_yaw_target)]
+    options = []
+    for option in DEFAULT_ANYGRASP_WRIST_CANDIDATES:
+        if option is None:
+            options.append(None)
+            continue
+        roll, pitch, yaw = option
+        try:
+            validate_wrist_target(G1JointIndex.RightWristRoll, roll)
+            validate_wrist_target(G1JointIndex.RightWristPitch, pitch)
+            validate_wrist_target(G1JointIndex.RightWristYaw, yaw)
+        except ValueError:
+            continue
+        if option not in options:
+            options.append(option)
+    requested = (args.wrist_roll_target, args.wrist_pitch_target, args.wrist_yaw_target)
+    if requested not in options:
+        options.append(requested)
+    return options
+
+
+def _wrist_label(wrist_targets: Optional[Tuple[float, float, float]]) -> str:
+    if wrist_targets is None:
+        return "free"
+    return "r{:+.2f}_p{:+.2f}_y{:+.2f}".format(*wrist_targets)
+
+
+def _target_with_safe_z(args: argparse.Namespace, target: np.ndarray) -> np.ndarray:
+    adjusted = np.asarray(target, dtype=float).copy()
+    if args.anygrasp_use_fixed_z:
+        adjusted[2] = args.fixed_grasp_z
+    elif args.anygrasp_candidate_mode:
+        adjusted[2] = max(float(adjusted[2]), float(args.anygrasp_min_z))
+    return adjusted
+
+
+def generate_anygrasp_candidates(args: argparse.Namespace, pose: AnyGraspPose) -> List[GraspCandidate]:
+    approach_axes = [pose.approach_pelvis]
+    if args.anygrasp_candidate_mode:
+        rotation_pelvis = camera_rotation_to_pelvis(pose.rotation_camera, args.camera_pitch)
+        for index in range(3):
+            _append_unique_axis(approach_axes, rotation_pelvis[:, index])
+
+    signs = [1.0, -1.0] if args.anygrasp_candidate_mode else [1.0]
+    palm_offsets = [args.anygrasp_palm_offset]
+    pregrasp_distances = [args.anygrasp_pregrasp_distance]
+    if args.anygrasp_candidate_mode:
+        palm_offsets = _unique_float_values(palm_offsets + [0.03, 0.05, 0.07])
+        pregrasp_distances = _unique_float_values(pregrasp_distances + [0.08, 0.12])
+
+    candidates = []
+    wrist_options = _candidate_wrist_options(args)
+    for axis_index, base_axis in enumerate(approach_axes):
+        for sign in signs:
+            approach = _normalize_vector(base_axis * sign, "AnyGrasp signed approach")
+            closing_axis = _safe_orthogonal_axis(pose.closing_axis_pelvis, approach, "AnyGrasp candidate closing axis")
+            for palm_offset in palm_offsets:
+                for pregrasp_distance in pregrasp_distances:
+                    grasp_target = _target_with_safe_z(args, pose.center_pelvis - approach * palm_offset)
+                    pre_target = _target_with_safe_z(args, grasp_target - approach * pregrasp_distance)
+                    for wrist_targets in wrist_options:
+                        label = (
+                            f"axis{axis_index}_sign{sign:+.0f}_palm{palm_offset:.2f}_"
+                            f"pre{pregrasp_distance:.2f}_wrist_{_wrist_label(wrist_targets)}"
+                        )
+                        candidates.append(
+                            GraspCandidate(
+                                label=label,
+                                pre_target=pre_target,
+                                grasp_target=grasp_target,
+                                approach_pelvis=approach,
+                                closing_axis_pelvis=closing_axis,
+                                palm_offset=float(palm_offset),
+                                pregrasp_distance=float(pregrasp_distance),
+                                wrist_targets=wrist_targets,
+                            )
+                        )
+    return candidates
+
+
+def command_position_residual(
+    target: np.ndarray,
+    q_values: np.ndarray,
+    waist_q: np.ndarray,
+    right_joints: Sequence[int],
+) -> float:
+    model_q = motor_to_model_q(q_values, np.ones(7))
+    pose = right_hand_pose(model_q, waist_q, right_joints)
+    return float(np.linalg.norm(target - pose[:3, 3]))
+
+
+def score_candidate_with_ik(
+    args: argparse.Namespace,
+    candidate: GraspCandidate,
+    waist_q: np.ndarray,
+    right_joints: Sequence[int],
+    q_start_values: np.ndarray,
+) -> Optional[CandidateSolution]:
+    try:
+        validate_target(candidate.pre_target)
+        validate_target(candidate.grasp_target)
+    except ValueError:
+        return None
+
+    ik_tolerance = args.tolerance
+    if args.anygrasp_candidate_mode:
+        ik_tolerance = max(args.tolerance, args.anygrasp_candidate_tolerance)
+
+    pre_ik, q_pre_values, q_pre = solve_right_q(
+        candidate.pre_target,
+        waist_q,
+        right_joints,
+        q_start_values,
+        ik_tolerance,
+    )
+    if candidate.wrist_targets is not None:
+        q_pre_values, q_pre = apply_wrist_targets(q_pre_values, q_pre, right_joints, *candidate.wrist_targets)
+
+    grasp_ik, q_grasp_values, q_grasp = solve_right_q(
+        candidate.grasp_target,
+        waist_q,
+        right_joints,
+        q_pre_values,
+        ik_tolerance,
+    )
+    if candidate.wrist_targets is not None:
+        q_grasp_values, q_grasp = apply_wrist_targets(q_grasp_values, q_grasp, right_joints, *candidate.wrist_targets)
+
+    pre_command_residual = command_position_residual(candidate.pre_target, q_pre_values, waist_q, right_joints)
+    grasp_command_residual = command_position_residual(candidate.grasp_target, q_grasp_values, waist_q, right_joints)
+    max_delta_pre = float(np.max(np.abs(q_pre_values - q_start_values)))
+    max_delta_lateral = float(np.max(np.abs(q_grasp_values - q_pre_values)))
+    wrist_penalty = 0.0 if candidate.wrist_targets is None else 0.02
+    score = (
+        float(pre_ik.residual)
+        + float(grasp_ik.residual)
+        + pre_command_residual
+        + grasp_command_residual
+        + 0.03 * max(max_delta_pre, max_delta_lateral)
+        + wrist_penalty
+    )
+    return CandidateSolution(
+        candidate=candidate,
+        pre_ik=pre_ik,
+        q_pre_values=q_pre_values,
+        q_pre=q_pre,
+        grasp_ik=grasp_ik,
+        q_grasp_values=q_grasp_values,
+        q_grasp=q_grasp,
+        pre_command_residual=pre_command_residual,
+        grasp_command_residual=grasp_command_residual,
+        score=score,
+    )
+
+
+def select_anygrasp_solution(
+    args: argparse.Namespace,
+    candidates: Sequence[GraspCandidate],
+    waist_q: np.ndarray,
+    right_joints: Sequence[int],
+    q_start_values: np.ndarray,
+) -> Tuple[Optional[CandidateSolution], List[CandidateSolution]]:
+    solutions = [
+        solution
+        for candidate in candidates
+        for solution in [score_candidate_with_ik(args, candidate, waist_q, right_joints, q_start_values)]
+        if solution is not None
+    ]
+    solutions.sort(key=lambda solution: solution.score)
+    print(f"anygrasp_candidate_count: {len(candidates)}")
+    print(f"anygrasp_scored_candidate_count: {len(solutions)}")
+    for index, solution in enumerate(solutions[: max(0, args.anygrasp_print_candidates)]):
+        print(
+            "anygrasp_candidate_score:"
+            f" rank={index + 1}"
+            f" score={solution.score:.4f}"
+            f" pre_ik={solution.pre_ik.residual:.4f}"
+            f" grasp_ik={solution.grasp_ik.residual:.4f}"
+            f" pre_cmd={solution.pre_command_residual:.4f}"
+            f" grasp_cmd={solution.grasp_command_residual:.4f}"
+            f" label={solution.candidate.label}"
+        )
+
+    acceptable = [
+        solution
+        for solution in solutions
+        if solution.pre_ik.success
+        and solution.grasp_ik.success
+        and solution.pre_command_residual <= args.anygrasp_max_command_residual
+        and solution.grasp_command_residual <= args.anygrasp_max_command_residual
+    ]
+    return (acceptable[0] if acceptable else None), solutions
+
+
+def _angle_for_width(args: argparse.Namespace, width_m: float) -> List[int]:
+    width_span = max(args.hand_width_max - args.hand_width_min, 1e-6)
+    ratio = min(max((width_m - args.hand_width_min) / width_span, 0.0), 1.0)
+    values = []
+    for closed, opened in zip(args.hand_grasp_angle, args.hand_open_angle):
+        values.append(int(round(float(closed) + ratio * (float(opened) - float(closed)))))
+    return [min(max(value, 0), 1000) for value in values]
+
+
+def build_anygrasp_hand_sequence(args: argparse.Namespace, width_m: Optional[float]) -> Optional[Dict[str, List[int]]]:
+    if not args.anygrasp_hand_from_width or width_m is None:
+        return None
+    open_angle = _angle_for_width(args, width_m + args.anygrasp_width_clearance)
+    preshape_angle = _angle_for_width(args, width_m + args.anygrasp_width_clearance * 0.5)
+    close_angle = _angle_for_width(args, width_m - args.anygrasp_width_clearance)
+    print("anygrasp_hand_width_source_m:", f"{width_m:.4f}")
+    print("anygrasp_hand_open_angle:", open_angle)
+    print("anygrasp_hand_preshape_angle:", preshape_angle)
+    print("anygrasp_hand_close_angle:", close_angle)
+    return {
+        "open": open_angle,
+        "preshape": preshape_angle,
+        "close": close_angle,
+    }
+
+
+def compute_anygrasp_targets(args: argparse.Namespace) -> Tuple[np.ndarray, np.ndarray]:
+    pose = load_anygrasp_pose(args)
+    candidates = generate_anygrasp_candidates(args, pose)
+    if not candidates:
+        raise ValueError("AnyGrasp did not produce any target candidates")
+    first = candidates[0]
+    print("anygrasp_pregrasp_target:", np.array2string(first.pre_target, precision=4))
+    print("anygrasp_grasp_target:", np.array2string(first.grasp_target, precision=4))
+    return first.pre_target, first.grasp_target
+
+
+def main() -> int:
+    args = parse_args()
+    if args.execute and not args.yes:
+        print("Refusing to move without --yes.", file=sys.stderr)
+        return 1
+    if args.weight <= 0.0 or args.weight > 1.0:
+        print("--weight must be in (0, 1].", file=sys.stderr)
+        return 2
+    if args.weight > 1.0 and not args.allow_full_weight:
+        print("Refusing --weight above 1.0 without --allow-full-weight.", file=sys.stderr)
+        return 2
+    if args.use_anygrasp_json and args.use_vision:
+        print("Refusing: use only one of --use-anygrasp-json or --use-vision.", file=sys.stderr)
+        return 2
+    if args.left_distance < 0.0 and not args.use_vision and not args.use_anygrasp_json:
+        print("--left-distance must be non-negative when --use-vision is not set.", file=sys.stderr)
+        return 2
+    if not args.no_vertical_wrist:
+        try:
+            validate_wrist_target(G1JointIndex.RightWristRoll, args.wrist_roll_target)
+            validate_wrist_target(G1JointIndex.RightWristPitch, args.wrist_pitch_target)
+            validate_wrist_target(G1JointIndex.RightWristYaw, args.wrist_yaw_target)
+        except ValueError as exc:
+            print(f"Refusing wrist target: {exc}", file=sys.stderr)
+            return 2
+    if min(args.pre_duration, args.lateral_duration, args.return_duration, args.release_duration) < 0.0:
+        print("Durations must be non-negative.", file=sys.stderr)
+        return 2
+    if args.anygrasp_width_clearance < 0.0 or args.anygrasp_min_z < 0.0 or args.anygrasp_candidate_tolerance <= 0.0:
+        print("AnyGrasp clearance/min-z values must be non-negative and candidate tolerance must be positive.", file=sys.stderr)
+        return 2
+    if args.hand_width_min < 0.0 or args.hand_width_max <= args.hand_width_min:
+        print("--hand-width-max must be greater than non-negative --hand-width-min.", file=sys.stderr)
+        return 2
+    hand_error = validate_hand_args(args)
+    if hand_error:
+        return hand_error
+    if args.execute and not args.skip_hand and not hand_tcp_preflight(args):
+        return 6
+
+    pre_target = np.asarray(args.pregrasp_target, dtype=float)
+    anygrasp_pose = None
+    anygrasp_hand_sequence = None
+    if args.use_anygrasp_json:
+        try:
+            anygrasp_pose = load_anygrasp_pose(args)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"Refusing AnyGrasp target: {exc}", file=sys.stderr)
+            return 2
+        grasp_target = pre_target.copy()
+    elif args.use_vision:
+        grasp_target = compute_vision_grasp_target(args, pre_target)
+        args.left_distance = float(grasp_target[1] - pre_target[1])
+    else:
+        grasp_target = pre_target.copy()
+        grasp_target[1] += args.left_distance
+    if anygrasp_pose is None:
+        for label, target in (("pregrasp", pre_target), ("grasp", grasp_target)):
+            try:
+                validate_target(target)
+            except ValueError as exc:
+                print(f"Refusing {label} target: {exc}", file=sys.stderr)
+                return 2
+
+        print("saved_pregrasp_target:", np.array2string(pre_target, precision=4))
+        print("final_grasp_target:", np.array2string(grasp_target, precision=4))
+        print(f"computed_x_delta: {float(grasp_target[0] - pre_target[0]):.4f}")
+        print(f"computed_left_distance: {args.left_distance:.4f}")
+
+    network_interface = detect_interface(args.network_interface)
+    print(f"network_interface: {network_interface}")
+    controller = OfficialStyleArmSdkController(network_interface, control_dt=0.02)
+    controller.init()
+    state = controller.wait_for_low_state(5.0)
+
+    right_joints = right_arm_joints(7)
+    arm_dq_max = joint_velocity_abs_max(state, LEFT_ARM_7DOF + right_joints)
+    waist_dq_max = joint_velocity_abs_max(state, WAIST_JOINTS)
+    print(f"start_arm_dq_abs_max: {arm_dq_max:.4f}")
+    print(f"start_waist_dq_abs_max: {waist_dq_max:.4f}")
+    if arm_dq_max > args.max_start_arm_dq:
+        print("Refusing: arms are already moving too fast.", file=sys.stderr)
+        return 3
+    if waist_dq_max > args.max_start_waist_dq:
+        print("Refusing: waist is already moving too fast.", file=sys.stderr)
+        return 3
+
+    q_left_hold = joint_positions(state, LEFT_ARM_7DOF)
+    q_waist_hold = joint_positions(state, WAIST_JOINTS)
+    q_right_start = joint_positions(state, right_joints)
+    q_start_values = joint_vector(state, right_joints)
+    waist_q = joint_vector(state, WAIST_JOINTS)
+
+    if anygrasp_pose is not None:
+        candidates = generate_anygrasp_candidates(args, anygrasp_pose)
+        selected_solution, scored_solutions = select_anygrasp_solution(
+            args,
+            candidates,
+            waist_q,
+            right_joints,
+            q_start_values,
+        )
+        if selected_solution is None:
+            if scored_solutions:
+                best = scored_solutions[0]
+                print(
+                    "best_anygrasp_candidate_rejected:"
+                    f" pre_ik_success={best.pre_ik.success}"
+                    f" grasp_ik_success={best.grasp_ik.success}"
+                    f" pre_cmd={best.pre_command_residual:.4f}"
+                    f" grasp_cmd={best.grasp_command_residual:.4f}"
+                    f" label={best.candidate.label}",
+                    file=sys.stderr,
+                )
+            print("Refusing execution because no AnyGrasp candidate met IK/FK safety checks.", file=sys.stderr)
+            return 4
+
+        selected_candidate = selected_solution.candidate
+        pre_target = selected_candidate.pre_target
+        grasp_target = selected_candidate.grasp_target
+        args.left_distance = float(grasp_target[1] - pre_target[1])
+        pre_ik = selected_solution.pre_ik
+        q_pre_values = selected_solution.q_pre_values
+        q_pre = selected_solution.q_pre
+        grasp_ik = selected_solution.grasp_ik
+        q_grasp_values = selected_solution.q_grasp_values
+        q_grasp = selected_solution.q_grasp
+        anygrasp_hand_sequence = build_anygrasp_hand_sequence(args, anygrasp_pose.width_m)
+        print("anygrasp_selected_candidate:", selected_candidate.label)
+        print("anygrasp_selected_approach_pelvis:", np.array2string(selected_candidate.approach_pelvis, precision=4))
+        print("anygrasp_selected_closing_axis_pelvis:", np.array2string(selected_candidate.closing_axis_pelvis, precision=4))
+        print(f"anygrasp_selected_palm_offset_m: {selected_candidate.palm_offset:.4f}")
+        print(f"anygrasp_selected_pregrasp_distance_m: {selected_candidate.pregrasp_distance:.4f}")
+        if selected_candidate.wrist_targets is None:
+            print("wrist_override_enabled: false")
+        else:
+            print("wrist_override_enabled:")
+            print(f"  RightWristRoll -> {selected_candidate.wrist_targets[0]:.4f} rad")
+            print(f"  RightWristPitch -> {selected_candidate.wrist_targets[1]:.4f} rad")
+            print(f"  RightWristYaw -> {selected_candidate.wrist_targets[2]:.4f} rad")
+        print("saved_pregrasp_target:", np.array2string(pre_target, precision=4))
+        print("final_grasp_target:", np.array2string(grasp_target, precision=4))
+        print(f"computed_x_delta: {float(grasp_target[0] - pre_target[0]):.4f}")
+        print(f"computed_left_distance: {args.left_distance:.4f}")
+    else:
+        pre_ik, q_pre_values, q_pre = solve_right_q(pre_target, waist_q, right_joints, q_start_values, args.tolerance)
+        if not args.no_vertical_wrist:
+            q_pre_values, q_pre = apply_wrist_targets(
+                q_pre_values,
+                q_pre,
+                right_joints,
+                args.wrist_roll_target,
+                args.wrist_pitch_target,
+                args.wrist_yaw_target,
+            )
+        grasp_ik, q_grasp_values, q_grasp = solve_right_q(grasp_target, waist_q, right_joints, q_pre_values, args.tolerance)
+        if not args.no_vertical_wrist:
+            q_grasp_values, q_grasp = apply_wrist_targets(
+                q_grasp_values,
+                q_grasp,
+                right_joints,
+                args.wrist_roll_target,
+                args.wrist_pitch_target,
+                args.wrist_yaw_target,
+            )
+            print("wrist_override_enabled:")
+            print(f"  RightWristRoll -> {args.wrist_roll_target:.4f} rad")
+            print(f"  RightWristPitch -> {args.wrist_pitch_target:.4f} rad")
+            print(f"  RightWristYaw -> {args.wrist_yaw_target:.4f} rad")
+        else:
+            print("wrist_override_enabled: false")
+
+    print_plan_item("pregrasp", pre_target, pre_ik, q_pre_values, q_start_values, right_joints)
+    print_command_position("pregrasp", pre_target, q_pre_values, waist_q, right_joints)
+    print_plan_item("grasp", grasp_target, grasp_ik, q_grasp_values, q_pre_values, right_joints)
+    print_command_position("grasp", grasp_target, q_grasp_values, waist_q, right_joints)
+    print("left_hold:")
+    print(format_joint_table(LEFT_ARM_7DOF, [q_left_hold[joint] for joint in LEFT_ARM_7DOF]))
+    print("waist_hold:")
+    print(format_joint_table(WAIST_JOINTS, [q_waist_hold[joint] for joint in WAIST_JOINTS]))
+
+    if not pre_ik.success or not grasp_ik.success:
+        print("Refusing execution because IK did not meet tolerance.", file=sys.stderr)
+        return 4
+
+    max_delta_pre = float(np.max(np.abs(q_pre_values - q_start_values)))
+    max_delta_lateral = float(np.max(np.abs(q_grasp_values - q_pre_values)))
+    max_delta = max(max_delta_pre, max_delta_lateral)
+    print(f"max_pre_delta_rad: {max_delta_pre:.4f}")
+    print(f"max_lateral_delta_rad: {max_delta_lateral:.4f}")
+    if max_delta > args.max_joint_delta:
+        print(f"Refusing execution: max joint delta {max_delta:.3f} exceeds {args.max_joint_delta:.3f}.", file=sys.stderr)
+        return 5
+
+    pre_duration = segment_duration(args.pre_duration, q_start_values, q_pre_values, args.max_joint_speed)
+    lateral_duration = segment_duration(args.lateral_duration, q_pre_values, q_grasp_values, args.max_joint_speed)
+    return_duration = segment_duration(args.return_duration, q_pre_values, q_start_values, args.max_joint_speed)
+    print(f"pre_duration_s: {pre_duration:.2f}")
+    print(f"lateral_duration_s: {lateral_duration:.2f}")
+    print(f"return_duration_s: {return_duration:.2f}")
+
+    if not args.execute:
+        print("Dry run only. Add --execute --yes to move the robot.")
+        return 0
+
+    q_right_last = dict(q_right_start)
+    exit_code = 0
+    try:
+        print("Stage 1: move to saved pregrasp target.")
+        run_timed_phase(controller, pre_duration, q_left_hold, q_waist_hold, q_right_start, q_pre, 0.0, args.weight, args)
+        q_right_last = dict(q_pre)
+        hold_group(controller, args.hold_before_open, q_left_hold, q_pre, q_waist_hold, args.weight, args)
+
+        if not args.skip_hand:
+            if anygrasp_hand_sequence is not None:
+                print("Stage 2: open hand from AnyGrasp width.")
+                write_hand_pose(hand_args(args), anygrasp_hand_sequence["open"], "anygrasp_open")
+                hold_group(controller, args.hold_after_open, q_left_hold, q_pre, q_waist_hold, args.weight, args)
+                print("Stage 2b: preshape hand from AnyGrasp width.")
+                write_hand_pose(hand_args(args), anygrasp_hand_sequence["preshape"], "anygrasp_preshape")
+            else:
+                print("Stage 2: open hand to maximum preset.")
+                write_hand_pose(hand_args(args), args.hand_open_angle, "max_open")
+            hold_group(controller, args.hold_after_open, q_left_hold, q_pre, q_waist_hold, args.weight, args)
+
+        print("Stage 3: move whole hand to final grasp target.")
+        run_timed_phase(controller, lateral_duration, q_left_hold, q_waist_hold, q_pre, q_grasp, args.weight, args.weight, args)
+        q_right_last = dict(q_grasp)
+        hold_group(controller, args.hold_before_grasp, q_left_hold, q_grasp, q_waist_hold, args.weight, args)
+
+        if not args.skip_hand:
+            print("Stage 4: grasp.")
+            if anygrasp_hand_sequence is not None:
+                write_hand_pose(hand_args(args), anygrasp_hand_sequence["close"], "anygrasp_close")
+            else:
+                write_hand_pose(hand_args(args), args.hand_grasp_angle, "grasp")
+            hold_group(controller, args.hold_after_grasp, q_left_hold, q_grasp, q_waist_hold, args.weight, args)
+
+        print("Stage 5: move back to saved pregrasp target.")
+        run_timed_phase(controller, lateral_duration, q_left_hold, q_waist_hold, q_grasp, q_pre, args.weight, args.weight, args)
+        q_right_last = dict(q_pre)
+
+        print("Stage 6: retract arm to start posture.")
+        run_timed_phase(controller, return_duration, q_left_hold, q_waist_hold, q_pre, q_right_start, args.weight, args.weight, args)
+        q_right_last = dict(q_right_start)
+    except KeyboardInterrupt:
+        print("Interrupted by user.", file=sys.stderr)
+        exit_code = 130
+    finally:
+        print("Stage 7: release arm_sdk.")
+        release_group(controller, q_left_hold, q_right_last, q_waist_hold, args.weight, args)
+        print("arm_sdk released.")
+
+    if exit_code == 0:
+        announce_success(args)
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
